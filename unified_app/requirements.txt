@@ -1,0 +1,11 @@
+streamlit 
+scrapegraphai[openai,ollama]
+playwright
+langchain>=1.2.0
+langchain-core>=1.2.1,<2.0.0
+langchain-classic>=1.0.0
+pandas
+openpyxl
+beautifulsoup4
+lxml
+html5lib
