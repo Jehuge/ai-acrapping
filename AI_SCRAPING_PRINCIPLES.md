@@ -1,424 +1,353 @@
-# 🤖 AI 网页抓取原理详解
+## AI 自动抓取网页实现原理
 
-## 📋 目录
-1. [整体架构](#整体架构)
-2. [工作流程](#工作流程)
-3. [核心节点详解](#核心节点详解)
-4. [与传统爬虫的区别](#与传统爬虫的区别)
-5. [优势与局限](#优势与局限)
 
 ---
 
-## 🏗️ 整体架构
+## 目录
 
-**ScrapeGraphAI** 使用**图（Graph）架构**，将网页抓取过程分解为多个**节点（Nodes）**，每个节点负责特定的任务：
-
-```
-用户输入 (URL + 提示词)
-    ↓
-┌─────────────────────────────────────┐
-│      SmartScraperGraph              │
-│  ┌──────────────────────────────┐  │
-│  │  1. FetchNode (获取网页)      │  │
-│  │  2. ParseNode (解析内容)     │  │
-│  │  3. GenerateAnswerNode (AI提取)│ │
-│  └──────────────────────────────┘  │
-└─────────────────────────────────────┘
-    ↓
-结构化数据输出
-```
+- [AI 自动抓取网页实现原理](#ai-自动抓取网页实现原理)
+- [目录](#目录)
+- [整体架构概览](#整体架构概览)
+- [配置与模型抽象：统一管理多家 LLM 厂商](#配置与模型抽象统一管理多家-llm-厂商)
+  - [AppConfig：统一入口](#appconfig统一入口)
+  - [build\_graph\_config：把差异收敛到一处](#build_graph_config把差异收敛到一处)
+- [统一 Scraping 流程：从 URL + Prompt 到结构化结果](#统一-scraping-流程从-url--prompt-到结构化结果)
+- [登录态与动态页面：为什么需要 Playwright](#登录态与动态页面为什么需要-playwright)
+- [历史记录与可观测性](#历史记录与可观测性)
+- [表格导出抓取工具的专用流程](#表格导出抓取工具的专用流程)
+  - [两种模式](#两种模式)
+- [与传统爬虫的对比与适用场景](#与传统爬虫的对比与适用场景)
+- [总结](#总结)
 
 ---
 
-## 🔄 工作流程
+## 整体架构概览
 
-### 标准流程（3个节点）
+从代码结构上看，这个项目可以拆成 4 个核心层次：
 
-```
-URL + 提示词
-    ↓
-[1] FetchNode (获取网页)
-    ├─ 使用 Playwright/Chromium 浏览器
-    ├─ 加载 JavaScript（如果需要）
-    ├─ 等待页面完全加载（networkidle）
-    └─ 输出：原始 HTML 文档
-    ↓
-[2] ParseNode (解析内容)
-    ├─ 清理 HTML（移除脚本、样式等）
-    ├─ 提取文本内容
-    ├─ 分块处理（chunking）
-    └─ 输出：清理后的文本块
-    ↓
-[3] GenerateAnswerNode (AI 提取)
-    ├─ 将用户提示词 + 网页内容发送给 LLM
-    ├─ LLM 理解并提取所需信息
-    ├─ 根据 schema 格式化输出
-    └─ 输出：结构化数据
-```
+- **UI 层（Streamlit）**：`unified_app/app.py`、`table_exporter.py`  
+- **配置与 LLM 抽象层**：`unified_app/config.py`  
+- **抓取与解析层**：`scrapegraphai.SmartScraperGraph` + Playwright  
+- **持久化与历史层**：`unified_app/history.py` + 本地 JSON 文件
 
-### 详细步骤说明
+用一张 Mermaid 架构图来描述整体组件关系：
 
-#### 步骤 1: FetchNode - 获取网页内容
+```mermaid
+graph TD
+    subgraph UI[UI 层：Streamlit Apps]
+        A[统一 Web Scraping 控制台<br/>unified_app/app.py]
+        B[表格导出抓取工具<br/>table_exporter.py]
+    end
 
-**技术实现：**
-- 使用 **Playwright** 或 **Chromium** 无头浏览器
-- 支持 JavaScript 渲染（`requires_js_support=True`）
-- 等待策略：
-  - `domcontentloaded`: 仅等待 DOM 加载
-  - `networkidle`: 等待所有网络请求完成（推荐）
-  - `load`: 等待所有资源加载
+    subgraph CFG[配置与模型抽象层<br/>unified_app/config.py]
+        C[AppConfig<br/>OpenAI/Ollama/LM Studio]
+        D[build_graph_config]
+    end
 
-**代码位置：**
-```python
-# scrapegraphai/nodes/fetch_node.py
-# 使用 ChromiumLoader 加载网页
-loader = ChromiumLoader(
-    urls=[url],
-    load_state="networkidle",
-    requires_js_support=True
-)
-document = loader.load()  # 返回 HTML 文档
+    subgraph SCRAPER[抓取与解析层]
+        E[Playwright<br/>Chromium 浏览器]
+        F[SmartScraperGraph<br/>LLM 智能解析]
+    end
+
+    subgraph HIST[历史记录与持久化<br/>unified_app/history.py]
+        G[append_history]
+        H[load_history]
+    end
+
+    A --> C
+    A --> D
+    A --> E
+    A --> F
+    A --> G
+    A --> H
+
+    B --> E
+    B --> F
 ```
 
-**输出：** 完整的 HTML 文档（包含所有标签、脚本等）
+**核心理念**：  
+在一个统一 UI 里，用户只需要：
+
+- 选一个「模型提供商」（OpenAI / Ollama / LM Studio）
+- 配好 API Key 或 Base URL
+- 输入「URL + 抓取需求的自然语言描述」
+
+后面的「加载网页」「登录」「解析 HTML」「让 LLM 理解页面并结构化输出」「记录历史」都由系统自动完成。
 
 ---
 
-#### 步骤 2: ParseNode - 解析和清理内容
+## 配置与模型抽象：统一管理多家 LLM 厂商
 
-**功能：**
-1. **HTML 清理**：
-   - 移除 `<script>`, `<style>`, `<meta>` 等标签
-   - 保留文本内容和结构标签
+统一多家 LLM 厂商的关键在 `unified_app/config.py`。代码里使用了 `dataclass` 把不同厂商的配置建模为统一对象：
 
-2. **文本提取**：
-   - 提取所有可见文本
-   - 保留基本的 HTML 结构（标题、段落、列表等）
+- `OpenAIConfig`
+- `OllamaConfig`
+- `LMStudioConfig`
+- `AppConfig`：顶层配置（包含当前选用的 `provider` 和三个子配置）
 
-3. **分块处理（Chunking）**：
-   - 将长文本分割成多个块
-   - 每个块大小 = `model_token`（模型的最大输入长度）
-   - 确保内容可以完整传递给 LLM
+### AppConfig：统一入口
 
-**代码位置：**
-```python
-# scrapegraphai/nodes/parse_node.py
-# 清理 HTML，提取文本，分块
-parsed_doc = parse_html(html_content)
-chunks = chunk_text(parsed_doc, chunk_size=model_token)
+`AppConfig` 做了两件事：
+
+- **持久化**：使用 `unified_config.json` 保存所有配置，`load()` / `save()` 即可读写；
+- **容错**：`load()` 时对字段做「默认值 + 覆盖」，避免因字段新增导致老配置崩溃。
+
+```mermaid
+classDiagram
+    class AppConfig {
+      +provider: "openai"|"ollama"|"lmstudio"
+      +openai: OpenAIConfig
+      +ollama: OllamaConfig
+      +lmstudio: LMStudioConfig
+      +load(): AppConfig
+      +save(): void
+    }
+
+    class OpenAIConfig {
+      +api_key: str
+      +model: str
+    }
+
+    class OllamaConfig {
+      +base_url: str
+      +model: str
+    }
+
+    class LMStudioConfig {
+      +base_url: str
+      +model: str
+      +api_key: str
+    }
+
+    AppConfig --> OpenAIConfig
+    AppConfig --> OllamaConfig
+    AppConfig --> LMStudioConfig
 ```
 
-**输出：** 清理后的文本块列表
+### build_graph_config：把差异收敛到一处
+
+`SmartScraperGraph` 只认识一种统一的 `config` 结构，因此各种 LLM 厂商的差异都通过 `build_graph_config(app_cfg)` 这一层来做「翻译」：
+
+- **OpenAI**：`model_provider = "openai" + api_key + model`
+- **Ollama**：`model_provider = "ollama" + model + base_url + embeddings`
+- **LM Studio**：对外暴露 OpenAI 兼容接口，因此在 ScrapeGraph 视角下仍然是 `model_provider = "openai"`，但 `base_url` 指向 LM Studio。
+
+这样的好处是：  
+UI 层只关心「当前选用的是 provider='openai' 还是 'ollama'」，而不需要知道底层调用细节。
 
 ---
 
-#### 步骤 3: GenerateAnswerNode - AI 智能提取
+## 统一 Scraping 流程：从 URL + Prompt 到结构化结果
 
-**核心原理：**
+统一应用的主入口是 `unified_app/app.py` 里的 `main()` 函数。工作流可以概括为：
 
-这是与传统爬虫**最关键的区别**！
+1. 载入配置 & 渲染侧边栏（模型厂商配置 + 历史记录）
+2. 用户输入：
+   - 目标 URL
+   - 抓取 Prompt（自然语言）
+   - 可选 JSON Schema（想要什么结构的 JSON）
+3. 根据用户的高级选项，构造 ScrapeGraph 的 `loader_kwargs`
+4. 点击「开始抓取」按钮后：
+   - 可选：如果需要登录 → 先用 Playwright 获取登录后的 HTML
+   - 根据是否有登录态 HTML，决定 `SmartScraperGraph` 的 `source` 是 URL 还是 HTML 字符串
+   - 执行 `graph.run()` 获取结果
+   - 写入历史记录并在前端展示
 
-**传统爬虫：**
-```python
-# 需要写固定的选择器
-title = soup.select_one('h1.title').text
-price = soup.select_one('.price').text
-# 如果网站结构改变，代码就失效了
+用一个简化的 Mermaid 时序图描述这个过程：
+
+```mermaid
+sequenceDiagram
+    actor U as 用户
+    participant ST as Streamlit UI
+    participant CFG as AppConfig
+    participant PW as Playwright
+    participant SG as SmartScraperGraph
+    participant HIS as History
+
+    U->>ST: 输入 URL + Prompt (+ JSON Schema)
+    ST->>CFG: AppConfig.load() & render_provider_settings()
+    ST->>CFG: build_graph_config()
+
+    U->>ST: 点击「开始抓取」
+    alt 需要登录
+        ST->>PW: fetch_html_with_playwright(url, login_options)
+        PW-->>ST: 登录后的 page_html
+        ST->>SG: SmartScraperGraph(prompt, source=page_html, config, schema)
+    else 不需要登录
+        ST->>SG: SmartScraperGraph(prompt, source=url, config, schema)
+    end
+
+    SG-->>ST: result (dict/str)
+    ST->>HIS: append_history(provider, url, prompt, result)
+    HIS-->>ST: 最新历史列表
+    ST-->>U: 展示结果(JSON/Markdown/调试 HTML)
 ```
 
-**AI 抓取：**
-```python
-# 只需要自然语言描述
-prompt = "提取产品名称和价格"
-# AI 自动理解页面结构，找到相关信息
-```
+**关键设计点**：
 
-**工作流程：**
-
-1. **构建提示词**：
-   ```
-   用户提示词: "提取首页的文字"
-   
-   实际发送给 LLM 的提示词:
-   """
-   请根据以下网页内容回答问题：
-   
-   用户问题：提取首页的文字
-   
-   网页内容：
-   [这里是 ParseNode 提取的文本内容]
-   
-   请提取相关信息并以 JSON 格式返回。
-   """
-   ```
-
-2. **LLM 处理**：
-   - LLM 阅读整个网页内容
-   - 理解用户的需求
-   - 识别相关内容（即使结构复杂）
-   - 提取并格式化数据
-
-3. **输出格式化**：
-   - 如果提供了 JSON Schema，按 schema 格式化
-   - 否则返回自然语言描述
-
-**代码位置：**
-```python
-# scrapegraphai/nodes/generate_answer_node.py
-# 构建提示词
-prompt = f"{user_prompt}\n\n网页内容：\n{parsed_content}"
-
-# 调用 LLM
-response = llm_model.invoke(prompt)
-
-# 解析响应
-result = parse_response(response)
-```
-
-**输出：** 结构化的 JSON 数据或文本
+- `source` 参数既可以是 URL，也可以是已经登录后的 HTML 字符串；
+- JSON Schema 是完全可选的，但提供时可以大幅提高输出的「可用度」；
+- 页面过大时会自动截断 HTML，以避免超出 LLM 上下文长度。
 
 ---
 
-## 🧩 核心节点详解
+## 登录态与动态页面：为什么需要 Playwright
 
-### 1. FetchNode（获取节点）
+很多现实场景中，目标页面都需要登录才能访问，例如：
 
-**职责：** 从 URL 获取网页内容
+- SaaS 后台报表
+- 内网管理系统
+- GitHub 私有仓库等
 
-**技术栈：**
-- **Playwright**: 无头浏览器，支持现代网页
-- **Chromium**: Chrome 内核，支持 JavaScript
-- **代理支持**: 可配置代理服务器
+**问题**：ScrapeGraph 自己不会「点登录」「输密码」「过验证码」。  
+**解决方案**：在 ScrapeGraph 之前插入一层 Playwright 流程：
 
-**配置选项：**
-```python
-loader_kwargs = {
-    "load_state": "networkidle",      # 等待策略
-    "requires_js_support": True,        # 启用 JS
-    "timeout": 60,                     # 超时时间
-    "headless": True                   # 无头模式
-}
+1. 启动 Chromium 浏览器；
+2. 访问登录页（或目标页）；
+3. 用户可选择：
+   - 手动登录（打开真实浏览器窗口，自己操作）；
+   - 利用已保存的 `login_state.json` 自动登录；
+4. 登录成功后，获取当前页面 HTML 并返回给上层；
+5. 把 HTML 作为 `SmartScraperGraph` 的 `source` 输入。
+
+登录流程的简化示意：
+
+```mermaid
+flowchart LR
+    A[需要登录?] -->|Yes| B[检查 login_state.json]
+    B -->|有效| C[带 storage_state 打开浏览器]
+    B -->|无效/不存在| D[打开登录页手动登录]
+    D --> E[用户在浏览器中完成登录]
+    C --> F[访问目标 URL]
+    E --> F
+    F --> G[page.content() -> HTML]
+    G --> H[作为 SmartScraperGraph 的 source]
+
+    A -->|No| I[直接把 URL 交给 SmartScraperGraph]
 ```
 
+工程上还有一些容错设计：
+
+- 读取 `login_state.json` 时会检查是否为空 / JSON 损坏，异常则自动删除并忽略；
+- 对 Playwright 的超时有兜底策略（`networkidle` 超时时会退回到 `domcontentloaded`）。
+
 ---
 
-### 2. ParseNode（解析节点）
+## 历史记录与可观测性
 
-**职责：** 清理 HTML，提取文本，分块处理
+`unified_app/history.py` 提供了一个非常轻量的历史系统：
 
-**处理流程：**
+- 使用 `HistoryItem` 数据类描述每条记录：
+  - 时间戳
+  - 使用的 provider（openai / ollama / lmstudio）
+  - URL
+  - Prompt
+  - Result 摘要（自动从结果中截取前 200 字）
+- 使用 `scrape_history.json` 保存最近 N 条（`MAX_HISTORY = 200`）。
+
+侧边栏通过 `render_history()` 把这些历史渲染出来，点击可以看到：
+
+- 本次抓取的 URL、Prompt；
+- 自动生成的结果摘要（方便快速回忆）。
+
+这一层虽然简单，但在调试与实际使用时提升很明显：
+
+- 方便回溯「当时用的是什么 Prompt / 配置」；
+- 可以用来构建后续的「二次分析」功能（例如对历史结果做对比等）。
+
+---
+
+## 表格导出抓取工具的专用流程
+
+`table_exporter.py` 是另一个独立入口，专门用来解决「网页上有导出按钮，点击后下载表格」这种高频需求。
+
+### 两种模式
+
+1. **点击导出按钮模式**：
+   - 输入 URL + 「导出按钮的描述」（如“导出表格”、“Export CSV”）；
+   - Playwright 自动查找匹配按钮（按文本、属性、多种选择器兜底）并点击；
+   - 使用 `page.expect_download()` 等待浏览器下载文件；
+   - 使用 pandas 自动解析 CSV / Excel / JSON / TSV 为 DataFrame；
+   - 在前端展示预览，并提供 CSV / Excel / JSON 三种格式的下载。
+
+2. **抓取页面数据模式**：
+   - 不依赖导出按钮，而是直接从 DOM 解析：
+     - 优先解析 `<table>` → DataFrame；
+     - 对 GitHub 仓库列表做了专门优化（先在浏览器内用 JS 组装结构化 JSON，再转 DataFrame）；
+     - 如果没有表格，则退回到 `<ul>/<ol>`、链接列表等通用结构提取。
+
+整体流程图：
+
+```mermaid
+flowchart TD
+    U[用户输入 URL + 模式 + 描述] --> BTN[点击「开始抓取」]
+    BTN --> ST[Streamlit 调用 asyncio.run(scrape_table)]
+
+    subgraph ScrapeTable[async scrape_table(...)]
+        ST --> LG[可选登录流程<br/>与 unified_app 逻辑类似]
+        LG --> PG[访问目标页面]
+
+        PG -->|模式: 点击导出按钮| FB[find_and_click_button]
+        FB --> DL[expect_download 等待文件]
+        DL --> PF[parse_table_file -> DataFrame]
+
+        PG -->|模式: 抓取页面数据| SD[scrape_page_data]
+        SD --> PH[parse_html_to_dataframe -> DataFrame]
+    end
+
+    PF --> OUT[前端展示表格 + 导出文件]
+    PH --> OUT
 ```
-原始 HTML
-  ↓
-移除脚本、样式、注释
-  ↓
-提取文本内容
-  ↓
-保留结构标签（h1, p, div 等）
-  ↓
-分块（chunking）
-  ↓
-清理后的文本块
-```
 
-**为什么需要分块？**
-- LLM 有最大输入长度限制（如 8192 tokens）
-- 长网页需要分割成多个块
-- 每个块独立处理，最后合并结果
+这里完全没有用 LLM，而是传统工程手段：
+
+- Playwright 负责「模拟人」去点按钮 / 打开页面；
+- BeautifulSoup + pandas 负责「解析 HTML/文件 → DataFrame」；
+- Streamlit 负责可视化与导出。
 
 ---
 
-### 3. GenerateAnswerNode（生成答案节点）
+## 与传统爬虫的对比与适用场景
 
-**职责：** 使用 LLM 理解和提取信息
+**统一 Web Scraping AI Agent** 的设计并不是要「替代所有传统爬虫」，而是解决一类新的、典型的需求：
 
-**关键优势：**
+- 目标网站结构复杂，经常改版；
+- 需要理解文本语义，而不仅仅是 DOM 位置；
+- 希望用「自然语言」描述抓取需求，而不是写 CSS/XPath。
 
-1. **语义理解**：
-   - 理解"首页的文字"的含义
-   - 自动识别主要内容区域
-   - 忽略导航栏、页脚等
+简单对比：
 
-2. **结构适应**：
-   - 不需要固定的 CSS 选择器
-   - 适应不同的 HTML 结构
-   - 处理动态内容
+| 维度 | 传统爬虫 | 本项目的 AI Scraping |
+|------|----------|----------------------|
+| 选择器 | 必须写 CSS/XPath | 用自然语言 Prompt |
+| 结构变动 | 很敏感，易崩 | LLM 具备一定鲁棒性 |
+| 语义理解 | 几乎没有 | 能理解上下文与描述 |
+| 动态渲染 | 需要额外处理 | Playwright + LLM 统一处理 |
+| 成本 | 低（CPU 即可） | 相对高（LLM 调用） |
+| 适合规模 | 大规模批量抓取 | 小规模、交互式探索 |
 
-3. **智能提取**：
-   - 理解上下文关系
-   - 提取相关但分散的信息
-   - 格式化输出
+**适合用本项目的场景**：
 
-**示例：**
+- 做数据探索 / 原型验证：快速看某个页面能不能抓到你想要的信息；
+- 面向运营 / 产品 / 分析：不写代码，只写需求描述即可抓数据；
+- 网站结构复杂、变化频繁：写选择器成本很高时；
+- 需要结合语义理解：比如「提取候选人的核心经历」这类非结构化信息。
 
-**输入：**
-```html
-<div class="product">
-  <h2>iPhone 15</h2>
-  <span class="price">¥5999</span>
-</div>
-```
+**更适合传统爬虫的场景**：
 
-**传统爬虫：**
-```python
-# 需要知道具体的类名
-name = soup.select_one('.product h2').text
-price = soup.select_one('.product .price').text
-```
-
-**AI 抓取：**
-```python
-# 只需要描述需求
-prompt = "提取产品名称和价格"
-# AI 自动找到相关信息
-```
+- 高并发大规模批量抓取；
+- 强实时性、强稳定性要求；
+- 结构高度稳定且简单的页面。
 
 ---
 
-## 🆚 与传统爬虫的区别
+## 总结
 
-| 特性 | 传统爬虫 | AI 抓取 |
-|------|---------|---------|
-| **选择器** | 需要写 CSS/XPath 选择器 | 自然语言描述 |
-| **结构变化** | 网站改版后失效 | 自动适应 |
-| **理解能力** | 只能提取固定位置 | 语义理解，智能提取 |
-| **动态内容** | 需要特殊处理 | 自动处理 JS 渲染 |
-| **成本** | 低（代码运行） | 高（需要 LLM API） |
-| **速度** | 快 | 较慢（需要 LLM 推理） |
-| **准确性** | 高（精确选择） | 中等（依赖 LLM 理解） |
+- **统一应用 (`unified_app`)**：负责把「多厂商 LLM + ScrapeGraphAI + 登录态浏览器抓取 + 历史记录」整合成一个一键式控制台。  
+- **表格导出工具 (`table_exporter`)**：专注于「自动点导出按钮 + 解析表格」这一类高频场景，偏传统工程方案。  
+- **Playwright** 解决的是「如何拿到正确的页面 HTML（含登录态 & 动态渲染）」；  
+- **ScrapeGraphAI + LLM** 解决的是「如何用自然语言把页面内容转成结构化结果」。  
 
----
+整体上，这个项目既是一个可以直接用的抓取工具箱，也是一个完整的示例：在真实工程里，如何优雅地把 LLM 接入到传统 Web 抓取链路之中。
 
-## ✅ 优势与局限
-
-### 优势
-
-1. **灵活性**：
-   - 不需要写复杂的 CSS 选择器
-   - 适应网站结构变化
-   - 处理复杂的 HTML 结构
-
-2. **智能理解**：
-   - 理解语义，不只是匹配文本
-   - 提取相关但分散的信息
-   - 处理非结构化内容
-
-3. **自然语言交互**：
-   - 用自然语言描述需求
-   - 不需要编程知识
-   - 快速适应新需求
-
-### 局限
-
-1. **成本**：
-   - 需要 LLM API（OpenAI、本地模型等）
-   - 每次抓取都需要调用 LLM
-   - 成本比传统爬虫高
-
-2. **速度**：
-   - LLM 推理需要时间
-   - 比传统爬虫慢
-   - 不适合大规模批量抓取
-
-3. **准确性**：
-   - 依赖 LLM 的理解能力
-   - 可能提取错误信息
-   - 需要验证结果
-
-4. **Token 限制**：
-   - LLM 有最大输入长度限制
-   - 超长网页需要分块处理
-   - 可能丢失部分信息
-
----
-
-## 🎯 适用场景
-
-### ✅ 适合使用 AI 抓取：
-
-1. **快速原型开发**：快速验证抓取需求
-2. **结构复杂的网站**：难以写选择器的网站
-3. **频繁变化的网站**：结构经常变化的网站
-4. **非结构化内容**：需要理解语义的内容
-5. **小规模抓取**：不需要大规模批量处理
-
-### ❌ 不适合使用 AI 抓取：
-
-1. **大规模批量抓取**：成本太高
-2. **需要高精度**：传统爬虫更可靠
-3. **实时性要求高**：LLM 推理较慢
-4. **简单结构化数据**：传统爬虫更高效
-
----
-
-## 🔍 实际工作示例
-
-### 示例：抓取产品信息
-
-**输入：**
-- URL: `https://example.com/products`
-- 提示词: "提取所有产品名称和价格"
-
-**流程：**
-
-1. **FetchNode**：
-   ```python
-   # 使用 Playwright 加载网页
-   browser = await chromium.launch()
-   page = await browser.new_page()
-   await page.goto(url, wait_until="networkidle")
-   html = await page.content()
-   ```
-
-2. **ParseNode**：
-   ```python
-   # 清理 HTML
-   soup = BeautifulSoup(html, 'html.parser')
-   # 移除脚本和样式
-   for script in soup(["script", "style"]):
-       script.decompose()
-   # 提取文本
-   text = soup.get_text()
-   # 分块
-   chunks = chunk_text(text, size=8192)
-   ```
-
-3. **GenerateAnswerNode**：
-   ```python
-   # 构建提示词
-   prompt = f"""
-   请从以下网页内容中提取所有产品名称和价格：
-   
-   {chunks[0]}
-   
-   请以 JSON 格式返回：
-   {{
-     "products": [
-       {{"name": "...", "price": "..."}}
-     ]
-   }}
-   """
-   
-   # 调用 LLM
-   response = llm.invoke(prompt)
-   # 返回: {"products": [{"name": "iPhone 15", "price": "¥5999"}]}
-   ```
-
----
-
-## 📚 总结
-
-AI 网页抓取的核心是**将网页内容理解任务交给 LLM**，而不是依赖固定的选择器规则。这使得抓取过程更加灵活和智能，但同时也带来了成本和速度的权衡。
-
-**关键点：**
-- ✅ 使用浏览器获取完整网页（包括 JS 渲染）
-- ✅ 清理和解析 HTML 内容
-- ✅ 使用 LLM 理解和提取信息
-- ✅ 返回结构化数据
-
-**选择建议：**
-- 小规模、快速原型 → AI 抓取
-- 大规模、高精度 → 传统爬虫
-- 复杂结构、频繁变化 → AI 抓取
-- 简单结构、固定格式 → 传统爬虫
 
