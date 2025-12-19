@@ -216,13 +216,12 @@ sequenceDiagram
 flowchart LR
     A[需要登录?] -->|Yes| B[检查 login_state.json]
     B -->|有效| C[带 storage_state 打开浏览器]
-    B -->|无效/不存在| D[打开登录页手动登录]
-    D --> E[用户在浏览器中完成登录]
+    B -->|无效或不存在| D[打开登录页手动登录]
+    D --> E[用户完成登录]
     C --> F[访问目标 URL]
     E --> F
     F --> G[page.content() -> HTML]
     G --> H[作为 SmartScraperGraph 的 source]
-
     A -->|No| I[直接把 URL 交给 SmartScraperGraph]
 ```
 
@@ -281,21 +280,17 @@ flowchart LR
 ```mermaid
 flowchart TD
     U[用户输入 URL + 模式 + 描述] --> BTN[点击「开始抓取」]
-    BTN --> ST[Streamlit 调用 asyncio.run(scrape_table)]
-
+    BTN --> ST[调用 asyncio.run(scrape_table)]
     subgraph ScrapeTable[async scrape_table(...)]
-        ST --> LG[可选登录流程<br/>与 unified_app 逻辑类似]
+        ST --> LG[可选登录流程，与统一应用一致]
         LG --> PG[访问目标页面]
-
-        PG -->|模式: 点击导出按钮| FB[find_and_click_button]
+        PG -->|点击导出按钮模式| FB[find_and_click_button]
         FB --> DL[expect_download 等待文件]
         DL --> PF[parse_table_file -> DataFrame]
-
-        PG -->|模式: 抓取页面数据| SD[scrape_page_data]
+        PG -->|抓取页面数据模式| SD[scrape_page_data]
         SD --> PH[parse_html_to_dataframe -> DataFrame]
     end
-
-    PF --> OUT[前端展示表格 + 导出文件]
+    PF --> OUT[展示表格 + 导出文件]
     PH --> OUT
 ```
 
