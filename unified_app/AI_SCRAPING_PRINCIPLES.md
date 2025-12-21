@@ -210,19 +210,19 @@ sequenceDiagram
 4. 登录成功后，获取当前页面 HTML 并返回给上层；
 5. 把 HTML 作为 `SmartScraperGraph` 的 `source` 输入。
 
-登录流程的简化示意：
+登录流程的简化示意（已重写为更简单、稳定的 Mermaid 语法）：
 
 ```mermaid
 flowchart LR
-    A[需要登录?] -->|Yes| B[检查 login_state.json]
-    B -->|有效| C[带 storage_state 打开浏览器]
-    B -->|无效或不存在| D[打开登录页手动登录]
+    A[需要登录] --> B{有 login_state.json 吗}
+    B -->|是| C[使用 storage_state 打开浏览器]
+    B -->|否| D[打开登录页供手动登录]
     D --> E[用户完成登录]
     C --> F[访问目标 URL]
     E --> F
-    F --> G[page.content() -> HTML]
-    G --> H[作为 SmartScraperGraph 的 source]
-    A -->|No| I[直接把 URL 交给 SmartScraperGraph]
+    F --> G[获取页面 HTML]
+    G --> H[将 HTML 作为 SmartScraperGraph 的输入]
+    B -->|不适用| I[直接把 URL 交给 SmartScraperGraph]
 ```
 
 工程上还有一些容错设计：
@@ -275,22 +275,20 @@ flowchart LR
      - 对 GitHub 仓库列表做了专门优化（先在浏览器内用 JS 组装结构化 JSON，再转 DataFrame）；
      - 如果没有表格，则退回到 `<ul>/<ol>`、链接列表等通用结构提取。
 
-整体流程图：
+整体流程图（已重写为更简单的节点序列以提高渲染兼容性）：
 
 ```mermaid
 flowchart TD
-    U[用户输入 URL + 模式 + 描述] --> BTN[点击「开始抓取」]
-    BTN --> ST[调用 asyncio.run(scrape_table)]
-    subgraph ScrapeTable[async scrape_table(...)]
-        ST --> LG[可选登录流程，与统一应用一致]
-        LG --> PG[访问目标页面]
-        PG -->|点击导出按钮模式| FB[find_and_click_button]
-        FB --> DL[expect_download 等待文件]
-        DL --> PF[parse_table_file -> DataFrame]
-        PG -->|抓取页面数据模式| SD[scrape_page_data]
-        SD --> PH[parse_html_to_dataframe -> DataFrame]
-    end
-    PF --> OUT[展示表格 + 导出文件]
+    U[用户输入 URL 与模式] --> BTN[点击 开始抓取]
+    BTN --> ST[运行 scrape_table]
+    ST --> LG[可选登录流程]
+    LG --> PG[访问目标页面]
+    PG --> FB[尝试点击导出按钮]
+    FB --> DL[等待并接收下载]
+    DL --> PF[解析下载文件为 DataFrame]
+    PG --> SD[直接从页面抓取表格数据]
+    SD --> PH[解析页面为 DataFrame]
+    PF --> OUT[展示并导出表格]
     PH --> OUT
 ```
 
