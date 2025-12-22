@@ -15,6 +15,8 @@ ENV/
 # 登录状态文件（包含敏感信息）
 login_state.json
 *.json.bak
+redbook_storage.json
+unified_app/redbook_storage.json
 
 # 临时文件
 temp.xlsx
